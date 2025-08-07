@@ -1,29 +1,55 @@
-name: Deploy to Server
+# Workflow Name
+name: Deploy to Production Server
 
+# Trigger
+# Runs on a push to the 'main' branch
 on:
   push:
     branches:
-      - main # Or 'master', depending on your repository's default branch
+      - main
 
+# Jobs
 jobs:
   deploy:
+    # Runner environment
     runs-on: ubuntu-latest
+
+    # Steps to execute
     steps:
-      # Updated step to first create the .ssh directory
+      # Step 1: Add Server's SSH Key to Known Hosts
+      # This securely verifies the identity of your server to prevent man-in-the-middle attacks.
       - name: Add Server to Known Hosts
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
 
-      # Your existing deployment step
+      # Step 2: SSH into Server and Run Deployment Script
+      # This uses your server's SSH key to log in, then runs the script.
       - name: SSH and Deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
+          host: ${{ secrets.SERVER_HOST }}      # Your server's IP address
+          username: ${{ secrets.SERVER_USER }}  # The user to log in as (e.g., 'root')
+          key: ${{ secrets.SERVER_SSH_KEY }}     # The private SSH key for server access
+
+          # The script that runs on your server after logging in
           script: |
+            # Navigate to the project directory
             cd ${{ secrets.PROJECT_PATH }}
+
+            # Securely pull the latest code from GitHub
+            # This uses the Fine-grained PAT over HTTPS for authentication.
+            # The 'github.repository' variable automatically inserts 'aeitroc/BitsManager'.
             echo "Pulling latest code from GitHub..."
             git pull https://x-access-token:${{ secrets.ACTION_PAT }}@github.com/${{ github.repository }}.git main
-            echo "Deployment complete! 🎉"
+
+            # --- OPTIONAL POST-DEPLOYMENT COMMANDS ---
+            # Add any commands needed to build your app or restart services.
+            # Example for a Node.js app using PM2:
+            # echo "Installing NPM dependencies..."
+            # npm install --production
+            # echo "Restarting application..."
+            # pm2 restart bitsmanager-app
+            # -----------------------------------------
+
+            echo "Deployment to server complete! 🎉"
