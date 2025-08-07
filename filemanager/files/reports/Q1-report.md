@@ -11,7 +11,7 @@ This is a sample quarterly report demonstrating the file browser's ability to ha
 - Customer Satisfaction: 94%
 
 ## Recommendations
- 
+  
 1. Continue current growth strategy
 2. Invest in customer service
 3. Expand product line
