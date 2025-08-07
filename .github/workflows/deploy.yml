@@ -9,9 +9,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      # NEW STEP: Automatically add the server's host key to the runner's known_hosts file
+      # Updated step to first create the .ssh directory
       - name: Add Server to Known Hosts
-        run: ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
 
       # Your existing deployment step
       - name: SSH and Deploy
