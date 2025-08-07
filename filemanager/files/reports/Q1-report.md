@@ -10,7 +10,7 @@ This is a sample quarterly report demonstrating the file browser's ability to ha
 - Growth: 15% YoY
 - Customer Satisfaction: 94%
 
-## Recommendations 
+## Recommendations  
   
 1. Continue current growth strategy
 2. Invest in customer service
