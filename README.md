@@ -1,4 +1,4 @@
-# BitsManager
+# BitsManager - Simple PHP File Browser
 
 BitsManager is a web-based project designed to help you manage and organize your digital assets efficiently.
 
