@@ -1,7 +1,5 @@
-# This is the name of the workflow, which will be displayed on the Actions tab
 name: Deploy to Server
 
-# This workflow triggers on a push event to the 'main' branch
 on:
   push:
     branches:
@@ -11,29 +9,19 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      # This step remains the same. It uses your SSH key to log into the server.
+      # NEW STEP: Automatically add the server's host key to the runner's known_hosts file
+      - name: Add Server to Known Hosts
+        run: ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      # Your existing deployment step
       - name: SSH and Deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-
-          # The script is updated to use the PAT for the 'git pull' command
           script: |
-            # Navigate to the project directory on your server
             cd ${{ secrets.PROJECT_PATH }}
-
-            # Pull the latest changes using the PAT for HTTPS authentication.
-            # The 'github.repository' variable automatically provides your 'username/repo-name'.
             echo "Pulling latest code from GitHub..."
             git pull https://x-access-token:${{ secrets.ACTION_PAT }}@github.com/${{ github.repository }}.git main
-
-            # (Optional) Add your build or restart commands here
-            # echo "Installing dependencies..."
-            # npm install --production
-            #
-            # echo "Restarting application..."
-            # pm2 restart my-app-name
-
             echo "Deployment complete! 🎉"
