@@ -7,39 +7,33 @@ on:
     branches:
       - main # Or 'master', depending on your repository's default branch
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   deploy:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Step 1: Log in to the server using the stored secrets
+      # This step remains the same. It uses your SSH key to log into the server.
       - name: SSH and Deploy
-        # Uses a popular community action for SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
+
+          # The script is updated to use the PAT for the 'git pull' command
           script: |
-            # Step 2: Navigate to the project directory on your server
+            # Navigate to the project directory on your server
             cd ${{ secrets.PROJECT_PATH }}
 
-            # Step 3: Pull the latest changes from the 'main' branch
-            git pull origin main
+            # Pull the latest changes using the PAT for HTTPS authentication.
+            # The 'github.repository' variable automatically provides your 'username/repo-name'.
+            echo "Pulling latest code from GitHub..."
+            git pull https://x-access-token:${{ secrets.ACTION_PAT }}@github.com/${{ github.repository }}.git main
 
-            # Step 4 (Optional): Add any build or restart commands here
-            # For example, if it's a Node.js application:
+            # (Optional) Add your build or restart commands here
             # echo "Installing dependencies..."
             # npm install --production
             #
-            # echo "Restarting application with PM2..."
+            # echo "Restarting application..."
             # pm2 restart my-app-name
-            #
-            # For a PHP/Laravel application:
-            # composer install --no-dev --optimize-autoloader
-            # php artisan migrate --force
 
             echo "Deployment complete! 🎉"
