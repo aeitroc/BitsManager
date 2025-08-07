@@ -1,0 +1,16 @@
+# Prevent directory listing
+Options -Indexes
+
+# For enhanced security, you might want rules here to control access
+# to php files, but we will handle that within the PHP scripts.
+
+# Optional: Restrict access to sensitive files
+<Files "*.htaccess">
+    Order allow,deny
+    Deny from all
+</Files>
+
+# Optional: Add security headers
+Header always set X-Content-Type-Options nosniff
+Header always set X-Frame-Options DENY
+Header always set X-XSS-Protection "1; mode=block"

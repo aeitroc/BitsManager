@@ -1,0 +1,18 @@
+# Sample Document
+
+This is a sample text document to demonstrate the file browser functionality.
+
+## Features
+
+- Secure file browsing
+- Bootstrap 5 styling
+- Responsive design
+- Icon-based file type recognition
+
+## Security
+
+The file browser implements several security measures:
+- Path validation to prevent directory traversal
+- Real path resolution
+- File type validation
+- Secure download handling
