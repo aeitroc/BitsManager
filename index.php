@@ -1,6 +1,33 @@
 <?php
 session_start();
 
+// Handle file downloads
+if (isset($_GET['download']) && isset($_SESSION['loggedin']) && $_SESSION['loggedin'] == true) {
+    $root_path = realpath(getcwd());
+    $download_file = realpath($root_path . '/' . $_GET['download']);
+    
+    // Security check: Ensure the file is within the root directory
+    if ($download_file && strpos($download_file, $root_path) === 0 && is_file($download_file)) {
+        $filename = basename($download_file);
+        $filesize = filesize($download_file);
+        
+        // Set headers to force download
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Content-Length: ' . $filesize);
+        header('Cache-Control: no-cache, must-revalidate');
+        header('Pragma: no-cache');
+        
+        // Output file content
+        readfile($download_file);
+        exit();
+    } else {
+        // File not found or access denied
+        header('HTTP/1.0 404 Not Found');
+        exit('File not found or access denied.');
+    }
+}
+
 // --- CONFIGURATION ---
 $config_file = 'config.php'; 
 
@@ -351,24 +378,135 @@ if (isset($_POST['password'])) {
 
 <?php if (isset($_SESSION['loggedin']) && $_SESSION['loggedin'] == true): ?>
 
+<?php
+    // Sanitize and manage the current path first
+    $root_path = realpath(getcwd());
+    $current_path = isset($_GET['path']) ? realpath($root_path . '/' . $_GET['path']) : $root_path;
+
+    // Security check: Ensure the path is within the root directory
+    if (strpos($current_path, $root_path) !== 0) {
+        $current_path = $root_path;
+    }
+
+    // Handle file upload (multiple files up to 10)
+    $upload_message = '';
+    if (isset($_FILES['upload_files'])) {
+        $messages = [];
+        if (!is_writable($current_path)) {
+            $messages[] = '<div style="color: #e94560; margin-bottom: 15px;">Upload directory is not writable: ' . htmlspecialchars($current_path) . '</div>';
+        } else {
+            // Normalize the files array
+            $names = $_FILES['upload_files']['name'];
+            $tmp_names = $_FILES['upload_files']['tmp_name'];
+            $errors = $_FILES['upload_files']['error'];
+
+            // Filter out empty slots
+            $file_indices = [];
+            foreach ((array)$names as $idx => $n) {
+                if ($n !== null && $n !== '') { $file_indices[] = $idx; }
+            }
+
+            $total = count($file_indices);
+            if ($total === 0) {
+                // No file selected – keep message empty
+            } else {
+                $limit = 10;
+                if ($total > $limit) {
+                    $messages[] = '<div style="color: #e94560; margin-bottom: 10px;">You selected ' . (int)$total . ' files. Uploading the first ' . $limit . ' only.</div>';
+                }
+
+                $processed = 0;
+                foreach ($file_indices as $i) {
+                    if ($processed >= $limit) { break; }
+
+                    $name = basename($names[$i]);
+                    $err = isset($errors[$i]) ? $errors[$i] : UPLOAD_ERR_NO_FILE;
+                    $tmp = isset($tmp_names[$i]) ? $tmp_names[$i] : '';
+
+                    if ($err === UPLOAD_ERR_NO_FILE || $name === '') {
+                        continue;
+                    }
+
+                    // Map common upload errors to readable messages
+                    if ($err !== UPLOAD_ERR_OK) {
+                        $msg = 'Upload error (' . (int)$err . ') for: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
+                        if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) { $msg = 'File too large: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
+                        elseif ($err === UPLOAD_ERR_PARTIAL) { $msg = 'Partial upload: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
+                        elseif ($err === UPLOAD_ERR_NO_TMP_DIR) { $msg = 'Missing temp folder for: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
+                        elseif ($err === UPLOAD_ERR_CANT_WRITE) { $msg = 'Failed to write file: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
+                        elseif ($err === UPLOAD_ERR_EXTENSION) { $msg = 'Upload blocked by extension for: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
+                        $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">' . $msg . '</div>';
+                        $processed++;
+                        continue;
+                    }
+
+                    $target_file = $current_path . '/' . $name;
+                    if (file_exists($target_file)) {
+                        $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">File already exists: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</div>';
+                    } elseif (move_uploaded_file($tmp, $target_file)) {
+                        $messages[] = '<div style="color: #27ae60; margin-bottom: 6px;">Uploaded: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</div>';
+                    } else {
+                        $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Failed to upload: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</div>';
+                    }
+                    $processed++;
+                }
+            }
+        }
+
+        // Combine messages for display
+        if (!empty($messages)) {
+            $upload_message = implode("\n", $messages);
+        }
+    }
+
+    // Handle delete all files
+    $delete_message = '';
+    if (isset($_POST['delete_all_files'])) {
+        $deleted_count = 0;
+        $files = scandir($current_path);
+        foreach ($files as $file) {
+            $filePath = $current_path . '/' . $file;
+            if ($file !== "." && $file !== ".." && $file !== basename(__FILE__) && $file !== 'config.php' && is_file($filePath)) {
+                if (unlink($filePath)) {
+                    $deleted_count++;
+                }
+            }
+        }
+        $delete_message = '<div style="color: #e94560; margin-bottom: 15px;">Deleted ' . $deleted_count . ' files.</div>';
+    }
+
+    $relative_path = ltrim(str_replace($root_path, '', $current_path), '/');
+?>
+
     <div class="container">
         <div class="header">
             <h1>Quantum File Explorer</h1>
             <a href="?logout=true" class="logout-btn">Logout</a>
         </div>
 
-        <?php
-        // Sanitize and manage the current path
-        $root_path = realpath(getcwd());
-        $current_path = isset($_GET['path']) ? realpath($root_path . '/' . $_GET['path']) : $root_path;
+        <!-- File Upload Form -->
+        <form method="post" enctype="multipart/form-data" style="margin-bottom: 20px;">
+            <?php if (isset($_GET['path'])): ?>
+                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path']); ?>">
+            <?php endif; ?>
+            <input type="file" name="upload_files[]" multiple required>
+            <input type="submit" value="Upload Files (up to 10)" style="background: var(--primary-color); color: #fff; border: none; border-radius: 8px; padding: 8px 16px; margin-left: 10px; cursor: pointer;">
+        </form>
 
-        // Security check: Ensure the path is within the root directory
-        if (strpos($current_path, $root_path) !== 0) {
-            $current_path = $root_path;
-        }
+        <!-- Upload Message -->
+        <?php echo $upload_message; ?>
 
-        $relative_path = ltrim(str_replace($root_path, '', $current_path), '/');
-        ?>
+        <!-- Delete Message -->
+        <?php echo $delete_message; ?>
+
+        <!-- Delete All Files Button -->
+        <form method="post" onsubmit="return confirm('Are you sure you want to delete all files in this directory?');" style="margin-bottom: 20px;">
+            <?php if (isset($_GET['path'])): ?>
+                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path']); ?>">
+            <?php endif; ?>
+            <input type="hidden" name="delete_all_files" value="1">
+            <input type="submit" value="Delete All Files" style="background: #e94560; color: #fff; border: none; border-radius: 8px; padding: 8px 16px; cursor: pointer;">
+        </form>
 
         <div class="breadcrumbs">
             <i class="fas fa-folder-open icon"></i>
@@ -419,7 +557,7 @@ if (isset($_POST['password'])) {
                         $modified = filemtime($filePath);
                         
                         $link_path = ltrim($relative_path . '/' . $file, '/');
-                        $link = $isDir ? '?path=' . urlencode($link_path) : $link_path;
+                        $link = $isDir ? '?path=' . urlencode($link_path) : '?download=' . urlencode($link_path);
 
                         echo "<tr>";
                         echo "<td><i class='icon " . htmlspecialchars($icon, ENT_QUOTES, 'UTF-8') . "'></i><a href=\"" . htmlspecialchars($link, ENT_QUOTES, 'UTF-8') . "\">" . htmlspecialchars($file, ENT_QUOTES, 'UTF-8') . "</a></td>";
@@ -511,5 +649,4 @@ if (isset($_POST['password'])) {
     </script>
 </body>
 </html>
-
 
