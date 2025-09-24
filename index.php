@@ -1,56 +1,302 @@
 <?php
+declare(strict_types=1);
+
+$httpsRequest = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] === '443');
+$cookieParams = [
+    'lifetime' => 0,
+    'path' => '/',
+    'domain' => '',
+    'secure' => $httpsRequest,
+    'httponly' => true,
+    'samesite' => 'Strict',
+];
+
+if (PHP_VERSION_ID >= 70300) {
+    session_set_cookie_params($cookieParams);
+} else {
+    session_set_cookie_params(
+        $cookieParams['lifetime'],
+        $cookieParams['path'] . '; samesite=Strict',
+        $cookieParams['domain'],
+        $cookieParams['secure'],
+        $cookieParams['httponly']
+    );
+}
+
+ini_set('session.cookie_httponly', '1');
+ini_set('session.cookie_secure', $cookieParams['secure'] ? '1' : '0');
+ini_set('session.cookie_samesite', 'Strict');
+
 session_start();
 
+define('APP_ROOT', __DIR__);
+define('CONFIG_FILE', APP_ROOT . '/config.php');
+define('SETUP_LOCK_FILE', APP_ROOT . '/.setup_lock');
+define('LOG_DIRECTORY', APP_ROOT . '/logs');
+define('LOG_FILE', LOG_DIRECTORY . '/app.log');
+define('MAX_UPLOAD_FILES', 10);
+define('MAX_UPLOAD_BYTES', 10 * 1024 * 1024); // 10 MB per file
+define('ALLOWED_UPLOAD_EXTENSIONS', [
+    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'csv', 'zip', 'tar', 'gz'
+]);
+
+header('X-Frame-Options: DENY');
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: same-origin');
+header('X-Robots-Tag: noindex, nofollow');
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; img-src 'self' data:; connect-src 'self';");
+
+if ($cookieParams['secure']) {
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+}
+
+if (!is_dir(LOG_DIRECTORY)) {
+    @mkdir(LOG_DIRECTORY, 0750, true);
+}
+
+if (is_dir(LOG_DIRECTORY)) {
+    @touch(LOG_FILE);
+    @chmod(LOG_FILE, 0640);
+}
+
+function audit_log(string $event, array $context = []): void
+{
+    $payload = [
+        'timestamp' => date('c'),
+        'event' => $event,
+        'ip' => $_SERVER['REMOTE_ADDR'] ?? 'cli',
+        'context' => $context,
+    ];
+
+    $line = json_encode($payload, JSON_UNESCAPED_SLASHES) . PHP_EOL;
+    @file_put_contents(LOG_FILE, $line, FILE_APPEND | LOCK_EX);
+}
+
+function safe_realpath(string $base, string $path): ?string
+{
+    if ($path === '' || $path === '/') {
+        return $base;
+    }
+
+    $candidate = realpath($base . '/' . $path);
+    if ($candidate === false) {
+        audit_log('path_resolution_failed', ['requestedPath' => $path]);
+        return null;
+    }
+
+    if (strpos($candidate, $base) !== 0) {
+        audit_log('path_traversal_blocked', ['requestedPath' => $path]);
+        return null;
+    }
+
+    return $candidate;
+}
+
+function issue_csrf_token(string $action): string
+{
+    if (!isset($_SESSION['csrf_tokens']) || !is_array($_SESSION['csrf_tokens'])) {
+        $_SESSION['csrf_tokens'] = [];
+    }
+
+    $token = bin2hex(random_bytes(32));
+    $_SESSION['csrf_tokens'][$action] = [
+        'value' => $token,
+        'issued' => time(),
+    ];
+
+    return $token;
+}
+
+function get_csrf_token(string $action): string
+{
+    if (isset($_SESSION['csrf_tokens'][$action])) {
+        $data = $_SESSION['csrf_tokens'][$action];
+        if (is_array($data) && isset($data['value'], $data['issued']) && (time() - $data['issued']) < 1800) {
+            return $data['value'];
+        }
+    }
+
+    return issue_csrf_token($action);
+}
+
+function validate_csrf_token(string $action, ?string $token): bool
+{
+    if (!isset($_SESSION['csrf_tokens'][$action])) {
+        return false;
+    }
+
+    $data = $_SESSION['csrf_tokens'][$action];
+    if (!is_array($data) || !isset($data['value'], $data['issued'])) {
+        return false;
+    }
+
+    if ((time() - $data['issued']) >= 1800) {
+        unset($_SESSION['csrf_tokens'][$action]);
+        return false;
+    }
+
+    $isValid = hash_equals($data['value'], (string)$token);
+
+    if ($isValid) {
+        unset($_SESSION['csrf_tokens'][$action]);
+    }
+
+    return $isValid;
+}
+
+function normalize_upload_filename(string $filename): string
+{
+    $basename = basename($filename);
+    // Remove control chars and spaces
+    $sanitized = preg_replace('/[^A-Za-z0-9._-]/', '_', $basename);
+    return $sanitized ?? 'upload';
+}
+
 // Handle file downloads
-if (isset($_GET['download']) && isset($_SESSION['loggedin']) && $_SESSION['loggedin'] == true) {
-    $root_path = realpath(getcwd());
-    $download_file = realpath($root_path . '/' . $_GET['download']);
-    
-    // Security check: Ensure the file is within the root directory
-    if ($download_file && strpos($download_file, $root_path) === 0 && is_file($download_file)) {
-        $filename = basename($download_file);
-        $filesize = filesize($download_file);
-        
-        // Set headers to force download
+if (isset($_GET['download']) && isset($_SESSION['loggedin']) && $_SESSION['loggedin'] === true) {
+    $downloadTarget = safe_realpath(APP_ROOT, $_GET['download']);
+
+    if ($downloadTarget !== null && is_file($downloadTarget)) {
+        if ($downloadTarget === CONFIG_FILE || $downloadTarget === SETUP_LOCK_FILE || strpos($downloadTarget, LOG_DIRECTORY) === 0 || $downloadTarget === __FILE__) {
+            audit_log('file_download_denied_protected', ['path' => $_GET['download'] ?? '']);
+            header('HTTP/1.0 403 Forbidden');
+            exit('File not available for download.');
+        }
+
+        $filename = basename($downloadTarget);
+        clearstatcache(true, $downloadTarget);
+
+        if (!is_readable($downloadTarget)) {
+            audit_log('file_download_not_readable', ['file' => $filename, 'path' => $downloadTarget]);
+            header('HTTP/1.0 403 Forbidden');
+            exit('File not readable.');
+        }
+
+        $filesize = @filesize($downloadTarget);
+        $knownSize = $filesize !== false;
+
+        $logContext = ['file' => $filename];
+        if ($knownSize) {
+            $logContext['bytes'] = $filesize;
+        } else {
+            audit_log('file_download_filesize_unknown', $logContext);
+        }
+
+        audit_log('file_download', $logContext);
+
+        // Prepare response headers
         header('Content-Type: application/octet-stream');
         header('Content-Disposition: attachment; filename="' . $filename . '"');
-        header('Content-Length: ' . $filesize);
         header('Cache-Control: no-cache, must-revalidate');
         header('Pragma: no-cache');
-        
-        // Output file content
-        readfile($download_file);
-        exit();
-    } else {
-        // File not found or access denied
-        header('HTTP/1.0 404 Not Found');
-        exit('File not found or access denied.');
+        header('Accept-Ranges: none');
+        if ($knownSize) {
+            header('Content-Length: ' . (string)$filesize);
+        }
+
+        @set_time_limit(0);
+        if (function_exists('apache_setenv')) {
+            @apache_setenv('no-gzip', '1');
+        }
+        if (function_exists('ini_set')) {
+            @ini_set('zlib.output_compression', '0');
+        }
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+
+        $handle = @fopen($downloadTarget, 'rb');
+        if ($handle !== false) {
+            while (!feof($handle)) {
+                $buffer = fread($handle, 65536);
+                if ($buffer === false) {
+                    $lastError = error_get_last();
+                    audit_log('file_download_stream_error', ['file' => $filename, 'path' => $downloadTarget, 'error' => $lastError['message'] ?? 'unknown']);
+                    break;
+                }
+                echo $buffer;
+                if (function_exists('flush')) {
+                    flush();
+                }
+            }
+            fclose($handle);
+            exit();
+        }
+
+        $lastError = error_get_last();
+        audit_log('file_download_failed', ['file' => $filename, 'path' => $downloadTarget, 'reason' => 'fopen_failed', 'error' => $lastError['message'] ?? 'n/a']);
+        header('HTTP/1.1 500 Internal Server Error');
+        exit('Unable to read file.');
     }
+
+    // File not found or access denied
+    audit_log('file_download_denied', ['path' => $_GET['download'] ?? '']);
+    header('HTTP/1.0 404 Not Found');
+    exit('File not found or access denied.');
 }
 
 // --- CONFIGURATION ---
-$config_file = 'config.php'; 
 
-// Check if config file exists. If not, start setup.
-if (!file_exists($config_file)) {
-    if (isset($_POST['setup_password']) && isset($_POST['confirm_password'])) {
-        $password = $_POST['setup_password'];
-        $confirm_password = $_POST['confirm_password'];
+// Check if config file exists. If not, start setup or block reset depending on lock.
+if (!file_exists(CONFIG_FILE)) {
+    if (file_exists(SETUP_LOCK_FILE)) {
+        audit_log('setup_blocked_missing_config', []);
+        ?>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Configuration Missing</title>
+            <meta name="robots" content="noindex, nofollow">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { font-family: Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+                .container { max-width: 480px; padding: 30px; background: rgba(22, 33, 62, 0.8); border-radius: 12px; border: 1px solid rgba(233, 69, 96, 0.2); box-shadow: 0 8px 32px rgba(0,0,0,0.37); }
+                h1 { color: #e94560; }
+                a { color: #e94560; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Configuration Missing</h1>
+                <p>The application setup has already been completed, but the configuration file is missing. For security, automatic reconfiguration is disabled.</p>
+                <p>Please restore <code>config.php</code> from backup or contact the system administrator.</p>
+            </div>
+        </body>
+        </html>
+        <?php
+        exit();
+    }
+
+    if (isset($_POST['setup_password'], $_POST['confirm_password'])) {
+        $password = (string)$_POST['setup_password'];
+        $confirm_password = (string)$_POST['confirm_password'];
 
         if ($password === $confirm_password) {
-            if (strlen($password) >= 8) {
+            if (strlen($password) >= 12) {
                 $password_hash = password_hash($password, PASSWORD_DEFAULT);
-                $config_content = "<?php\n\n\$password_hash = '" . $password_hash . "';\n";
-                file_put_contents($config_file, $config_content);
-                header('Location: ' . htmlspecialchars($_SERVER['PHP_SELF'], ENT_QUOTES, 'UTF-8'));
-                exit();
+                $config_content = "<?php\nreturn [\n    'password_hash' => '" . $password_hash . "',\n];\n";
+                $writeResult = @file_put_contents(CONFIG_FILE, $config_content, LOCK_EX);
+                if ($writeResult !== false) {
+                    @chmod(CONFIG_FILE, 0640);
+                    @file_put_contents(SETUP_LOCK_FILE, (string)time(), LOCK_EX);
+                    audit_log('setup_completed', ['userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? 'unknown']);
+                    header('Location: ' . htmlspecialchars($_SERVER['PHP_SELF'], ENT_QUOTES, 'UTF-8'));
+                    exit();
+                }
+
+                $setup_error = 'Failed to write configuration file. Check directory permissions.';
+                audit_log('setup_write_failed', []);
             } else {
-                $setup_error = 'Password must be at least 8 characters long.';
+                $setup_error = 'Password must be at least 12 characters long.';
+                audit_log('setup_password_too_short', ['length' => strlen($password)]);
             }
         } else {
             $setup_error = 'Passwords do not match.';
+            audit_log('setup_password_mismatch', []);
         }
     }
+
     // Display setup form
     ?>
     <!DOCTYPE html>
@@ -122,7 +368,7 @@ if (!file_exists($config_file)) {
     <body>
         <div class="container">
             <h1>Welcome to Quantum File Explorer</h1>
-            <p>Please create a password to secure your file explorer.</p>
+            <p>Please create a strong administrator password (minimum 12 characters).</p>
             <form method="post" class="setup-form">
                 <?php if (isset($setup_error)): ?>
                     <p class="error-message"><?php echo htmlspecialchars($setup_error, ENT_QUOTES, 'UTF-8'); ?></p>
@@ -139,35 +385,78 @@ if (!file_exists($config_file)) {
 }
 
 // Include the configuration file
-require_once($config_file);
+$config = require CONFIG_FILE;
+$password_hash = is_array($config) && isset($config['password_hash']) ? $config['password_hash'] : null;
+
+if ($password_hash === null) {
+    audit_log('config_invalid', []);
+    header('HTTP/1.1 500 Internal Server Error');
+    exit('Configuration is invalid.');
+}
 
 // Logout logic
 if (isset($_GET['logout'])) {
+    audit_log('user_logout', []);
+    $_SESSION = [];
+    if (ini_get('session.use_cookies')) {
+        $params = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
+    }
     session_destroy();
     header('Location: ' . htmlspecialchars($_SERVER['PHP_SELF'], ENT_QUOTES, 'UTF-8'));
     exit();
 }
 
-// Brute-force protection
-if (!isset($_SESSION['login_attempts'])) {
-    $_SESSION['login_attempts'] = 0;
+// Brute-force protection state
+if (!isset($_SESSION['auth_state']) || !is_array($_SESSION['auth_state'])) {
+    $_SESSION['auth_state'] = [
+        'attempts' => 0,
+        'last_attempt' => 0,
+        'lock_until' => 0,
+    ];
 }
+
+$authState =& $_SESSION['auth_state'];
 
 // Check if login form has been submitted
 if (isset($_POST['password'])) {
-    if ($_SESSION['login_attempts'] < 5) {
-        if (password_verify($_POST['password'], $password_hash)) {
-            $_SESSION['loggedin'] = true;
-            $_SESSION['login_attempts'] = 0; // Reset on success
-            session_regenerate_id(true); // Prevent session fixation
-        } else {
-            $_SESSION['login_attempts']++;
-            $login_error = 'Invalid password!';
-        }
+    $csrfValid = validate_csrf_token('login', $_POST['csrf_token'] ?? null);
+    if (!$csrfValid) {
+        $login_error = 'Security token invalid. Please refresh and try again.';
+        audit_log('login_csrf_failed', []);
     } else {
-        $login_error = 'Too many failed login attempts. Please try again later.';
+        $now = time();
+        if ($authState['lock_until'] > $now) {
+            $remaining = $authState['lock_until'] - $now;
+            $minutes = ceil($remaining / 60);
+            $login_error = 'Too many failed attempts. Try again in approximately ' . $minutes . ' minute(s).';
+            audit_log('login_locked', ['remainingSeconds' => $remaining]);
+        } else {
+            if (password_verify((string)$_POST['password'], $password_hash)) {
+                $_SESSION['loggedin'] = true;
+                $authState = [
+                    'attempts' => 0,
+                    'last_attempt' => $now,
+                    'lock_until' => 0,
+                ];
+                session_regenerate_id(true); // Prevent session fixation
+                audit_log('login_success', []);
+            } else {
+                $authState['attempts']++;
+                $authState['last_attempt'] = $now;
+                $login_error = 'Invalid password!';
+                audit_log('login_failed', ['attempts' => $authState['attempts']]);
+
+                if ($authState['attempts'] >= 5) {
+                    $authState['lock_until'] = $now + 900; // 15 minutes cooldown
+                    audit_log('login_lock_applied', ['lockUntil' => $authState['lock_until']]);
+                }
+            }
+        }
     }
 }
+
+$loginCsrfToken = get_csrf_token('login');
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -376,106 +665,184 @@ if (isset($_POST['password'])) {
 </head>
 <body>
 
-<?php if (isset($_SESSION['loggedin']) && $_SESSION['loggedin'] == true): ?>
+<?php if (isset($_SESSION['loggedin']) && $_SESSION['loggedin'] === true): ?>
 
 <?php
     // Sanitize and manage the current path first
-    $root_path = realpath(getcwd());
-    $current_path = isset($_GET['path']) ? realpath($root_path . '/' . $_GET['path']) : $root_path;
+    $root_path = APP_ROOT;
+    $current_path = $root_path;
+    $relative_path = '';
 
-    // Security check: Ensure the path is within the root directory
-    if (strpos($current_path, $root_path) !== 0) {
+    if (isset($_GET['path']) && $_GET['path'] !== '') {
+        $resolved = safe_realpath($root_path, $_GET['path']);
+        if ($resolved !== null && is_dir($resolved)) {
+            if (strpos($resolved, LOG_DIRECTORY) === 0) {
+                audit_log('directory_access_denied_logs', ['requested' => $_GET['path']]);
+            } else {
+                $current_path = $resolved;
+            }
+        } else {
+            audit_log('directory_access_denied', ['requested' => $_GET['path']]);
+        }
+    }
+
+    if (!is_dir($current_path)) {
+        audit_log('directory_resolution_fallback', ['path' => $current_path]);
         $current_path = $root_path;
     }
 
-    // Handle file upload (multiple files up to 10)
+    $relative_path = ltrim(str_replace($root_path, '', $current_path), '/');
+
+    // Handle file upload (multiple files)
     $upload_message = '';
     if (isset($_FILES['upload_files'])) {
-        $messages = [];
-        if (!is_writable($current_path)) {
-            $messages[] = '<div style="color: #e94560; margin-bottom: 15px;">Upload directory is not writable: ' . htmlspecialchars($current_path) . '</div>';
+        if (!validate_csrf_token('upload', $_POST['csrf_token'] ?? null)) {
+            $upload_message = '<div style="color: #e94560; margin-bottom: 15px;">Security token invalid. Please retry the upload.</div>';
+            audit_log('upload_csrf_failed', ['path' => $relative_path]);
         } else {
-            // Normalize the files array
-            $names = $_FILES['upload_files']['name'];
-            $tmp_names = $_FILES['upload_files']['tmp_name'];
-            $errors = $_FILES['upload_files']['error'];
-
-            // Filter out empty slots
-            $file_indices = [];
-            foreach ((array)$names as $idx => $n) {
-                if ($n !== null && $n !== '') { $file_indices[] = $idx; }
-            }
-
-            $total = count($file_indices);
-            if ($total === 0) {
-                // No file selected – keep message empty
+            $messages = [];
+            if (!is_writable($current_path)) {
+                $messages[] = '<div style="color: #e94560; margin-bottom: 15px;">Upload directory is not writable: ' . htmlspecialchars($current_path, ENT_QUOTES, 'UTF-8') . '</div>';
+                audit_log('upload_directory_not_writable', ['path' => $current_path]);
             } else {
-                $limit = 10;
-                if ($total > $limit) {
-                    $messages[] = '<div style="color: #e94560; margin-bottom: 10px;">You selected ' . (int)$total . ' files. Uploading the first ' . $limit . ' only.</div>';
+                $names = $_FILES['upload_files']['name'] ?? [];
+                $tmp_names = $_FILES['upload_files']['tmp_name'] ?? [];
+                $errors = $_FILES['upload_files']['error'] ?? [];
+                $sizes = $_FILES['upload_files']['size'] ?? [];
+
+                $file_indices = [];
+                foreach ((array)$names as $idx => $n) {
+                    if ($n !== null && $n !== '') {
+                        $file_indices[] = $idx;
+                    }
                 }
 
-                $processed = 0;
-                foreach ($file_indices as $i) {
-                    if ($processed >= $limit) { break; }
-
-                    $name = basename($names[$i]);
-                    $err = isset($errors[$i]) ? $errors[$i] : UPLOAD_ERR_NO_FILE;
-                    $tmp = isset($tmp_names[$i]) ? $tmp_names[$i] : '';
-
-                    if ($err === UPLOAD_ERR_NO_FILE || $name === '') {
-                        continue;
+                $total = count($file_indices);
+                if ($total > 0) {
+                    if ($total > MAX_UPLOAD_FILES) {
+                        $messages[] = '<div style="color: #e94560; margin-bottom: 10px;">You selected ' . (int)$total . ' files. Uploading the first ' . MAX_UPLOAD_FILES . ' only.</div>';
                     }
 
-                    // Map common upload errors to readable messages
-                    if ($err !== UPLOAD_ERR_OK) {
-                        $msg = 'Upload error (' . (int)$err . ') for: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
-                        if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) { $msg = 'File too large: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
-                        elseif ($err === UPLOAD_ERR_PARTIAL) { $msg = 'Partial upload: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
-                        elseif ($err === UPLOAD_ERR_NO_TMP_DIR) { $msg = 'Missing temp folder for: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
-                        elseif ($err === UPLOAD_ERR_CANT_WRITE) { $msg = 'Failed to write file: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
-                        elseif ($err === UPLOAD_ERR_EXTENSION) { $msg = 'Upload blocked by extension for: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); }
-                        $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">' . $msg . '</div>';
+                    $processed = 0;
+                    $finfo = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : null;
+
+                    foreach ($file_indices as $i) {
+                        if ($processed >= MAX_UPLOAD_FILES) {
+                            break;
+                        }
+
+                        $originalName = (string)$names[$i];
+                        $sanitizedName = normalize_upload_filename($originalName);
+                        $extension = strtolower(pathinfo($sanitizedName, PATHINFO_EXTENSION));
+                        $err = isset($errors[$i]) ? $errors[$i] : UPLOAD_ERR_NO_FILE;
+                        $tmp = isset($tmp_names[$i]) ? $tmp_names[$i] : '';
+                        $size = isset($sizes[$i]) ? (int)$sizes[$i] : 0;
+
+                        if ($err === UPLOAD_ERR_NO_FILE || $sanitizedName === '') {
+                            continue;
+                        }
+
+                        if ($err !== UPLOAD_ERR_OK) {
+                            $msg = 'Upload error (' . (int)$err . ') for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8');
+                            if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) { $msg = 'File too large: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
+                            elseif ($err === UPLOAD_ERR_PARTIAL) { $msg = 'Partial upload: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
+                            elseif ($err === UPLOAD_ERR_NO_TMP_DIR) { $msg = 'Missing temp folder for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
+                            elseif ($err === UPLOAD_ERR_CANT_WRITE) { $msg = 'Failed to write file: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
+                            elseif ($err === UPLOAD_ERR_EXTENSION) { $msg = 'Upload blocked by PHP extension for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
+                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">' . $msg . '</div>';
+                            audit_log('upload_error_code', ['file' => $originalName, 'error' => $err]);
+                            $processed++;
+                            continue;
+                        }
+
+                        if ($extension === '' || !in_array($extension, ALLOWED_UPLOAD_EXTENSIONS, true)) {
+                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Blocked by policy (extension): ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            audit_log('upload_extension_blocked', ['file' => $originalName, 'extension' => $extension]);
+                            $processed++;
+                            continue;
+                        }
+
+                        if ($size > MAX_UPLOAD_BYTES) {
+                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">File exceeds ' . number_format(MAX_UPLOAD_BYTES / (1024 * 1024), 2) . ' MB limit: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            audit_log('upload_size_blocked', ['file' => $originalName, 'size' => $size]);
+                            $processed++;
+                            continue;
+                        }
+
+                        if (!is_uploaded_file($tmp)) {
+                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Upload validation failed for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            audit_log('upload_origin_invalid', ['file' => $originalName]);
+                            $processed++;
+                            continue;
+                        }
+
+                        $mime = null;
+                        if ($finfo) {
+                            $mime = finfo_file($finfo, $tmp) ?: null;
+                        }
+
+                        $target_file = $current_path . '/' . $sanitizedName;
+                        if (file_exists($target_file)) {
+                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">File already exists: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            audit_log('upload_exists', ['file' => $sanitizedName]);
+                        } elseif (move_uploaded_file($tmp, $target_file)) {
+                            @chmod($target_file, 0640);
+                            $messages[] = '<div style="color: #27ae60; margin-bottom: 6px;">Uploaded: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            audit_log('upload_success', ['file' => $sanitizedName, 'size' => $size, 'mime' => $mime]);
+                        } else {
+                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Failed to upload: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            audit_log('upload_move_failed', ['file' => $sanitizedName]);
+                        }
                         $processed++;
-                        continue;
                     }
 
-                    $target_file = $current_path . '/' . $name;
-                    if (file_exists($target_file)) {
-                        $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">File already exists: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</div>';
-                    } elseif (move_uploaded_file($tmp, $target_file)) {
-                        $messages[] = '<div style="color: #27ae60; margin-bottom: 6px;">Uploaded: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</div>';
-                    } else {
-                        $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Failed to upload: ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '</div>';
+                    if ($finfo) {
+                        finfo_close($finfo);
                     }
-                    $processed++;
                 }
             }
-        }
 
-        // Combine messages for display
-        if (!empty($messages)) {
-            $upload_message = implode("\n", $messages);
+            if (!empty($messages)) {
+                $upload_message = implode("\n", $messages);
+            }
         }
     }
 
     // Handle delete all files
     $delete_message = '';
     if (isset($_POST['delete_all_files'])) {
-        $deleted_count = 0;
-        $files = scandir($current_path);
-        foreach ($files as $file) {
-            $filePath = $current_path . '/' . $file;
-            if ($file !== "." && $file !== ".." && $file !== basename(__FILE__) && $file !== 'config.php' && is_file($filePath)) {
-                if (unlink($filePath)) {
+        if (!validate_csrf_token('delete_all', $_POST['csrf_token'] ?? null)) {
+            $delete_message = '<div style="color: #e94560; margin-bottom: 15px;">Security token invalid. Delete action blocked.</div>';
+            audit_log('delete_csrf_failed', ['path' => $relative_path]);
+        } else {
+            $deleted_count = 0;
+            $failed_count = 0;
+            $files = scandir($current_path);
+            foreach ($files as $file) {
+                if ($file === '.' || $file === '..' || $file === basename(__FILE__) || $file === 'config.php' || $file === basename(SETUP_LOCK_FILE) || $file === basename(LOG_DIRECTORY)) {
+                    continue;
+                }
+
+                $filePath = $current_path . '/' . $file;
+                $realFilePath = realpath($filePath);
+                if ($realFilePath === false || strpos($realFilePath, $current_path) !== 0 || !is_file($realFilePath)) {
+                    continue;
+                }
+
+                if (@unlink($realFilePath)) {
                     $deleted_count++;
+                } else {
+                    $failed_count++;
                 }
             }
+
+            $delete_message = '<div style="color: #e94560; margin-bottom: 15px;">Deleted ' . $deleted_count . ' file(s).' . ($failed_count > 0 ? ' Failed to delete ' . $failed_count . ' file(s).' : '') . '</div>';
+            audit_log('delete_all_invoked', ['path' => $relative_path, 'deleted' => $deleted_count, 'failed' => $failed_count]);
         }
-        $delete_message = '<div style="color: #e94560; margin-bottom: 15px;">Deleted ' . $deleted_count . ' files.</div>';
     }
 
-    $relative_path = ltrim(str_replace($root_path, '', $current_path), '/');
+    $uploadCsrfToken = get_csrf_token('upload');
+    $deleteCsrfToken = get_csrf_token('delete_all');
 ?>
 
     <div class="container">
@@ -486,11 +853,12 @@ if (isset($_POST['password'])) {
 
         <!-- File Upload Form -->
         <form method="post" enctype="multipart/form-data" style="margin-bottom: 20px;">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($uploadCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
             <?php if (isset($_GET['path'])): ?>
-                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path']); ?>">
+                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path'], ENT_QUOTES, 'UTF-8'); ?>">
             <?php endif; ?>
             <input type="file" name="upload_files[]" multiple required>
-            <input type="submit" value="Upload Files (up to 10)" style="background: var(--primary-color); color: #fff; border: none; border-radius: 8px; padding: 8px 16px; margin-left: 10px; cursor: pointer;">
+            <input type="submit" value="Upload Files (up to <?php echo MAX_UPLOAD_FILES; ?>)" style="background: var(--primary-color); color: #fff; border: none; border-radius: 8px; padding: 8px 16px; margin-left: 10px; cursor: pointer;">
         </form>
 
         <!-- Upload Message -->
@@ -501,8 +869,9 @@ if (isset($_POST['password'])) {
 
         <!-- Delete All Files Button -->
         <form method="post" onsubmit="return confirm('Are you sure you want to delete all files in this directory?');" style="margin-bottom: 20px;">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($deleteCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
             <?php if (isset($_GET['path'])): ?>
-                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path']); ?>">
+                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path'], ENT_QUOTES, 'UTF-8'); ?>">
             <?php endif; ?>
             <input type="hidden" name="delete_all_files" value="1">
             <input type="submit" value="Delete All Files" style="background: #e94560; color: #fff; border: none; border-radius: 8px; padding: 8px 16px; cursor: pointer;">
@@ -547,25 +916,38 @@ if (isset($_POST['password'])) {
                 }
 
                 $files = scandir($current_path);
+                $exclude = array_unique([
+                    '.',
+                    '..',
+                    basename(__FILE__),
+                    'config.php',
+                    basename(SETUP_LOCK_FILE),
+                    basename(LOG_DIRECTORY),
+                ]);
 
-                foreach($files as $file) {
-                    if ($file !== "." && $file !== ".." && $file !== basename(__FILE__) && $file !== 'config.php') {
-                        $filePath = $current_path . '/' . $file;
-                        $isDir = is_dir($filePath);
-                        $icon = $isDir ? 'fas fa-folder' : 'fas fa-file-alt';
-                        $size = $isDir ? -1 : filesize($filePath);
-                        $modified = filemtime($filePath);
-                        
-                        $link_path = ltrim($relative_path . '/' . $file, '/');
-                        $link = $isDir ? '?path=' . urlencode($link_path) : '?download=' . urlencode($link_path);
-
-                        echo "<tr>";
-                        echo "<td><i class='icon " . htmlspecialchars($icon, ENT_QUOTES, 'UTF-8') . "'></i><a href=\"" . htmlspecialchars($link, ENT_QUOTES, 'UTF-8') . "\">" . htmlspecialchars($file, ENT_QUOTES, 'UTF-8') . "</a></td>";
-                        echo "<td>" . ($isDir ? "Directory" : "File") . "</td>";
-                        echo "<td data-sort='" . htmlspecialchars($size, ENT_QUOTES, 'UTF-8') . "'>" . ($isDir ? "-" : formatSizeUnits($size)) . "</td>";
-                        echo "<td data-sort='" . htmlspecialchars($modified, ENT_QUOTES, 'UTF-8') . "'>" . date("Y-m-d H:i:s", $modified) . "</td>";
-                        echo "</tr>";
+                foreach ($files as $file) {
+                    if (in_array($file, $exclude, true)) {
+                        continue;
                     }
+
+                    $filePath = $current_path . '/' . $file;
+                    $isDir = is_dir($filePath);
+                    $icon = $isDir ? 'fas fa-folder' : 'fas fa-file-alt';
+                    $size = $isDir ? -1 : @filesize($filePath);
+                    $modified = @filemtime($filePath);
+                    $modifiedSort = $modified !== false ? $modified : 0;
+                    $modifiedDisplay = $modified !== false ? date('Y-m-d H:i:s', $modified) : 'Unknown';
+
+                    $link_path = ltrim($relative_path . '/' . $file, '/');
+                    $link = $isDir ? '?path=' . urlencode($link_path) : '?download=' . urlencode($link_path);
+
+                    echo "<tr>";
+                    echo "<td><i class='icon " . htmlspecialchars($icon, ENT_QUOTES, 'UTF-8') . "'></i><a href=\"" . htmlspecialchars($link, ENT_QUOTES, 'UTF-8') . "\">" . htmlspecialchars($file, ENT_QUOTES, 'UTF-8') . "</a></td>";
+                    echo "<td>" . ($isDir ? "Directory" : "File") . "</td>";
+                    $sizeSortValue = $isDir ? -1 : (int)$size;
+                    echo "<td data-sort='" . htmlspecialchars((string)$sizeSortValue, ENT_QUOTES, 'UTF-8') . "'>" . ($isDir ? "-" : formatSizeUnits($sizeSortValue)) . "</td>";
+                    echo "<td data-sort='" . htmlspecialchars((string)$modifiedSort, ENT_QUOTES, 'UTF-8') . "'>" . htmlspecialchars($modifiedDisplay, ENT_QUOTES, 'UTF-8') . "</td>";
+                    echo "</tr>";
                 }
                 ?>
             </tbody>
@@ -577,11 +959,12 @@ if (isset($_POST['password'])) {
     <div class="container login-container">
         <h1>Authentication Required</h1>
         <form method="post" class="login-form">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($loginCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
             <?php if (isset($login_error)): ?>
                 <p class="error-message"><?php echo htmlspecialchars($login_error, ENT_QUOTES, 'UTF-8'); ?></p>
             <?php endif; ?>
             <input type="password" name="password" placeholder="Enter Password" required>
-            <input type="submit" value="Login" <?php if (isset($_SESSION['login_attempts']) && $_SESSION['login_attempts'] >= 5) echo 'disabled'; ?>>
+            <input type="submit" value="Login" <?php if (isset($authState['lock_until']) && $authState['lock_until'] > time()) echo 'disabled'; ?>>
         </form>
     </div>
 
@@ -649,4 +1032,3 @@ if (isset($_POST['password'])) {
     </script>
 </body>
 </html>
-
