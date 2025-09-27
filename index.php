@@ -273,7 +273,7 @@ if (!file_exists(CONFIG_FILE)) {
         $confirm_password = (string)$_POST['confirm_password'];
 
         if ($password === $confirm_password) {
-            if (strlen($password) >= 12) {
+            if (strlen($password) >= 8) {
                 $password_hash = password_hash($password, PASSWORD_DEFAULT);
                 $config_content = "<?php\nreturn [\n    'password_hash' => '" . $password_hash . "',\n];\n";
                 $writeResult = @file_put_contents(CONFIG_FILE, $config_content, LOCK_EX);
@@ -285,10 +285,20 @@ if (!file_exists(CONFIG_FILE)) {
                     exit();
                 }
 
+                $lastError = error_get_last();
+                $writeContext = [
+                    'configPath' => CONFIG_FILE,
+                    'configExists' => file_exists(CONFIG_FILE),
+                    'configPerms' => file_exists(CONFIG_FILE) ? substr(sprintf('%o', @fileperms(CONFIG_FILE)), -4) : null,
+                    'dirWritable' => is_writable(APP_ROOT),
+                    'dirPerms' => substr(sprintf('%o', @fileperms(APP_ROOT)), -4),
+                    'diskFree' => @disk_free_space(APP_ROOT),
+                    'lastError' => $lastError['message'] ?? null,
+                ];
                 $setup_error = 'Failed to write configuration file. Check directory permissions.';
-                audit_log('setup_write_failed', []);
+                audit_log('setup_write_failed', $writeContext);
             } else {
-                $setup_error = 'Password must be at least 12 characters long.';
+                $setup_error = 'Password must be at least 8 characters long.';
                 audit_log('setup_password_too_short', ['length' => strlen($password)]);
             }
         } else {
@@ -368,13 +378,13 @@ if (!file_exists(CONFIG_FILE)) {
     <body>
         <div class="container">
             <h1>Welcome to Quantum File Explorer</h1>
-            <p>Please create a strong administrator password (minimum 12 characters).</p>
+            <p>Please create a strong administrator password (minimum 8 characters).</p>
             <form method="post" class="setup-form">
                 <?php if (isset($setup_error)): ?>
                     <p class="error-message"><?php echo htmlspecialchars($setup_error, ENT_QUOTES, 'UTF-8'); ?></p>
                 <?php endif; ?>
-                <input type="password" name="setup_password" placeholder="Enter New Password" required>
-                <input type="password" name="confirm_password" placeholder="Confirm Password" required>
+                <input type="password" name="setup_password" placeholder="Enter New Password" required minlength="8">
+                <input type="password" name="confirm_password" placeholder="Confirm Password" required minlength="8">
                 <input type="submit" value="Create Password">
             </form>
         </div>
@@ -385,11 +395,24 @@ if (!file_exists(CONFIG_FILE)) {
 }
 
 // Include the configuration file
+if (file_exists(CONFIG_FILE)) {
+    audit_log('config_pre_load', [
+        'size' => @filesize(CONFIG_FILE),
+        'readable' => is_readable(CONFIG_FILE),
+        'mtime' => @filemtime(CONFIG_FILE),
+        'lock_exists' => file_exists(SETUP_LOCK_FILE),
+    ]);
+}
+
 $config = require CONFIG_FILE;
 $password_hash = is_array($config) && isset($config['password_hash']) ? $config['password_hash'] : null;
 
 if ($password_hash === null) {
-    audit_log('config_invalid', []);
+    audit_log('config_invalid', [
+        'configType' => gettype($config),
+        'configKeys' => is_array($config) ? array_keys($config) : null,
+        'fileSize' => @filesize(CONFIG_FILE),
+    ]);
     header('HTTP/1.1 500 Internal Server Error');
     exit('Configuration is invalid.');
 }
@@ -537,6 +560,159 @@ $loginCsrfToken = get_csrf_token('login');
             background: #d43d51;
         }
 
+        .action-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .action-card {
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+        }
+
+        .action-card h2 {
+            margin: 0;
+            font-size: 1.35em;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .card-icon {
+            background: rgba(233, 69, 96, 0.15);
+            color: var(--primary-color);
+            width: 44px;
+            height: 44px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2em;
+        }
+
+        .card-subtitle {
+            margin: 4px 0 0;
+            font-size: 0.9em;
+            color: rgba(255, 255, 255, 0.65);
+        }
+
+        .upload-form {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 12px;
+            align-items: stretch;
+        }
+
+        .upload-form input[type="file"] {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            background: rgba(0, 0, 0, 0.35);
+            color: var(--text-color);
+            box-sizing: border-box;
+        }
+
+        .upload-form input[type="file"]::file-selector-button,
+        .upload-form input[type="file"]::-webkit-file-upload-button {
+            background: var(--secondary-color);
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            padding: 10px 16px;
+            margin-right: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background-color 0.3s ease;
+        }
+
+        .upload-form input[type="file"]::file-selector-button:hover,
+        .upload-form input[type="file"]::-webkit-file-upload-button:hover {
+            background: rgba(233, 69, 96, 0.35);
+        }
+
+        .form-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border: none;
+            border-radius: 8px;
+            padding: 12px 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.3s ease;
+            text-align: center;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: var(--primary-color);
+            color: #fff;
+            box-shadow: 0 8px 20px rgba(233, 69, 96, 0.25);
+        }
+
+        .btn-primary:hover {
+            background: #d43d51;
+            box-shadow: 0 12px 24px rgba(233, 69, 96, 0.28);
+            transform: translateY(-1px);
+        }
+
+        .btn-danger {
+            background: rgba(233, 69, 96, 0.18);
+            color: #fff;
+            border: 1px solid rgba(233, 69, 96, 0.4);
+        }
+
+        .btn-danger:hover {
+            background: rgba(233, 69, 96, 0.3);
+            transform: translateY(-1px);
+        }
+
+        .alert-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .alert {
+            border-radius: 8px;
+            padding: 12px 14px;
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid transparent;
+            font-size: 0.95em;
+        }
+
+        .alert-error {
+            color: var(--primary-color);
+            border-color: rgba(233, 69, 96, 0.35);
+            background: rgba(233, 69, 96, 0.08);
+        }
+
+        .alert-success {
+            color: #27ae60;
+            border-color: rgba(39, 174, 96, 0.35);
+            background: rgba(39, 174, 96, 0.08);
+        }
+
         .breadcrumbs {
             background-color: rgba(0,0,0,0.2);
             padding: 10px 15px;
@@ -661,6 +837,23 @@ $loginCsrfToken = get_csrf_token('login');
             th, td { padding: 12px 8px; }
             .header h1 { font-size: 2em; }
         }
+
+        @media (max-width: 640px) {
+            .upload-form {
+                grid-template-columns: 1fr;
+            }
+
+            .upload-form input[type="file"]::file-selector-button,
+            .upload-form input[type="file"]::-webkit-file-upload-button {
+                margin-right: 0;
+                margin-bottom: 10px;
+                width: 100%;
+            }
+
+            .btn {
+                width: 100%;
+            }
+        }
     </style>
 </head>
 <body>
@@ -697,12 +890,12 @@ $loginCsrfToken = get_csrf_token('login');
     $upload_message = '';
     if (isset($_FILES['upload_files'])) {
         if (!validate_csrf_token('upload', $_POST['csrf_token'] ?? null)) {
-            $upload_message = '<div style="color: #e94560; margin-bottom: 15px;">Security token invalid. Please retry the upload.</div>';
+            $upload_message = '<div class="alert alert-error">Security token invalid. Please retry the upload.</div>';
             audit_log('upload_csrf_failed', ['path' => $relative_path]);
         } else {
             $messages = [];
             if (!is_writable($current_path)) {
-                $messages[] = '<div style="color: #e94560; margin-bottom: 15px;">Upload directory is not writable: ' . htmlspecialchars($current_path, ENT_QUOTES, 'UTF-8') . '</div>';
+                $messages[] = '<div class="alert alert-error">Upload directory is not writable: ' . htmlspecialchars($current_path, ENT_QUOTES, 'UTF-8') . '</div>';
                 audit_log('upload_directory_not_writable', ['path' => $current_path]);
             } else {
                 $names = $_FILES['upload_files']['name'] ?? [];
@@ -720,7 +913,7 @@ $loginCsrfToken = get_csrf_token('login');
                 $total = count($file_indices);
                 if ($total > 0) {
                     if ($total > MAX_UPLOAD_FILES) {
-                        $messages[] = '<div style="color: #e94560; margin-bottom: 10px;">You selected ' . (int)$total . ' files. Uploading the first ' . MAX_UPLOAD_FILES . ' only.</div>';
+                        $messages[] = '<div class="alert alert-error">You selected ' . (int)$total . ' files. Uploading the first ' . MAX_UPLOAD_FILES . ' only.</div>';
                     }
 
                     $processed = 0;
@@ -749,28 +942,28 @@ $loginCsrfToken = get_csrf_token('login');
                             elseif ($err === UPLOAD_ERR_NO_TMP_DIR) { $msg = 'Missing temp folder for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
                             elseif ($err === UPLOAD_ERR_CANT_WRITE) { $msg = 'Failed to write file: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
                             elseif ($err === UPLOAD_ERR_EXTENSION) { $msg = 'Upload blocked by PHP extension for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8'); }
-                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">' . $msg . '</div>';
+                            $messages[] = '<div class="alert alert-error">' . $msg . '</div>';
                             audit_log('upload_error_code', ['file' => $originalName, 'error' => $err]);
                             $processed++;
                             continue;
                         }
 
                         if ($extension === '' || !in_array($extension, ALLOWED_UPLOAD_EXTENSIONS, true)) {
-                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Blocked by policy (extension): ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            $messages[] = '<div class="alert alert-error">Blocked by policy (extension): ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
                             audit_log('upload_extension_blocked', ['file' => $originalName, 'extension' => $extension]);
                             $processed++;
                             continue;
                         }
 
                         if ($size > MAX_UPLOAD_BYTES) {
-                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">File exceeds ' . number_format(MAX_UPLOAD_BYTES / (1024 * 1024), 2) . ' MB limit: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            $messages[] = '<div class="alert alert-error">File exceeds ' . number_format(MAX_UPLOAD_BYTES / (1024 * 1024), 2) . ' MB limit: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
                             audit_log('upload_size_blocked', ['file' => $originalName, 'size' => $size]);
                             $processed++;
                             continue;
                         }
 
                         if (!is_uploaded_file($tmp)) {
-                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Upload validation failed for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            $messages[] = '<div class="alert alert-error">Upload validation failed for: ' . htmlspecialchars($originalName, ENT_QUOTES, 'UTF-8') . '</div>';
                             audit_log('upload_origin_invalid', ['file' => $originalName]);
                             $processed++;
                             continue;
@@ -783,14 +976,14 @@ $loginCsrfToken = get_csrf_token('login');
 
                         $target_file = $current_path . '/' . $sanitizedName;
                         if (file_exists($target_file)) {
-                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">File already exists: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            $messages[] = '<div class="alert alert-error">File already exists: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
                             audit_log('upload_exists', ['file' => $sanitizedName]);
                         } elseif (move_uploaded_file($tmp, $target_file)) {
                             @chmod($target_file, 0640);
-                            $messages[] = '<div style="color: #27ae60; margin-bottom: 6px;">Uploaded: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            $messages[] = '<div class="alert alert-success">Uploaded: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
                             audit_log('upload_success', ['file' => $sanitizedName, 'size' => $size, 'mime' => $mime]);
                         } else {
-                            $messages[] = '<div style="color: #e94560; margin-bottom: 6px;">Failed to upload: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
+                            $messages[] = '<div class="alert alert-error">Failed to upload: ' . htmlspecialchars($sanitizedName, ENT_QUOTES, 'UTF-8') . '</div>';
                             audit_log('upload_move_failed', ['file' => $sanitizedName]);
                         }
                         $processed++;
@@ -812,7 +1005,7 @@ $loginCsrfToken = get_csrf_token('login');
     $delete_message = '';
     if (isset($_POST['delete_all_files'])) {
         if (!validate_csrf_token('delete_all', $_POST['csrf_token'] ?? null)) {
-            $delete_message = '<div style="color: #e94560; margin-bottom: 15px;">Security token invalid. Delete action blocked.</div>';
+            $delete_message = '<div class="alert alert-error">Security token invalid. Delete action blocked.</div>';
             audit_log('delete_csrf_failed', ['path' => $relative_path]);
         } else {
             $deleted_count = 0;
@@ -836,7 +1029,8 @@ $loginCsrfToken = get_csrf_token('login');
                 }
             }
 
-            $delete_message = '<div style="color: #e94560; margin-bottom: 15px;">Deleted ' . $deleted_count . ' file(s).' . ($failed_count > 0 ? ' Failed to delete ' . $failed_count . ' file(s).' : '') . '</div>';
+            $deleteStatusClass = $failed_count > 0 ? 'alert alert-error' : 'alert alert-success';
+            $delete_message = '<div class="' . $deleteStatusClass . '">Deleted ' . $deleted_count . ' file(s).' . ($failed_count > 0 ? ' Failed to delete ' . $failed_count . ' file(s).' : '') . '</div>';
             audit_log('delete_all_invoked', ['path' => $relative_path, 'deleted' => $deleted_count, 'failed' => $failed_count]);
         }
     }
@@ -851,31 +1045,62 @@ $loginCsrfToken = get_csrf_token('login');
             <a href="?logout=true" class="logout-btn">Logout</a>
         </div>
 
-        <!-- File Upload Form -->
-        <form method="post" enctype="multipart/form-data" style="margin-bottom: 20px;">
-            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($uploadCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
-            <?php if (isset($_GET['path'])): ?>
-                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path'], ENT_QUOTES, 'UTF-8'); ?>">
-            <?php endif; ?>
-            <input type="file" name="upload_files[]" multiple required>
-            <input type="submit" value="Upload Files (up to <?php echo MAX_UPLOAD_FILES; ?>)" style="background: var(--primary-color); color: #fff; border: none; border-radius: 8px; padding: 8px 16px; margin-left: 10px; cursor: pointer;">
-        </form>
+        <!-- File Actions -->
+        <section class="action-grid" aria-label="File actions">
+            <article class="action-card upload-card">
+                <div class="card-header">
+                    <span class="card-icon">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                    </span>
+                    <div>
+                        <h2>Upload Files</h2>
+                        <p class="card-subtitle">Select up to <?php echo MAX_UPLOAD_FILES; ?> files per upload.</p>
+                    </div>
+                </div>
+                <form method="post" enctype="multipart/form-data" class="upload-form">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($uploadCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+                    <?php if (isset($_GET['path'])): ?>
+                        <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path'], ENT_QUOTES, 'UTF-8'); ?>">
+                    <?php endif; ?>
+                    <input type="file" name="upload_files[]" multiple required>
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">Upload Files (up to <?php echo MAX_UPLOAD_FILES; ?>)</button>
+                    </div>
+                </form>
+                <?php if ($upload_message !== ''): ?>
+                    <div class="alert-stack" role="status" aria-live="polite">
+                        <?php echo $upload_message; ?>
+                    </div>
+                <?php endif; ?>
+            </article>
 
-        <!-- Upload Message -->
-        <?php echo $upload_message; ?>
-
-        <!-- Delete Message -->
-        <?php echo $delete_message; ?>
-
-        <!-- Delete All Files Button -->
-        <form method="post" onsubmit="return confirm('Are you sure you want to delete all files in this directory?');" style="margin-bottom: 20px;">
-            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($deleteCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
-            <?php if (isset($_GET['path'])): ?>
-                <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path'], ENT_QUOTES, 'UTF-8'); ?>">
-            <?php endif; ?>
-            <input type="hidden" name="delete_all_files" value="1">
-            <input type="submit" value="Delete All Files" style="background: #e94560; color: #fff; border: none; border-radius: 8px; padding: 8px 16px; cursor: pointer;">
-        </form>
+            <article class="action-card delete-card">
+                <div class="card-header">
+                    <span class="card-icon">
+                        <i class="fas fa-trash-alt"></i>
+                    </span>
+                    <div>
+                        <h2>Delete All Files</h2>
+                        <p class="card-subtitle">Remove every file in the current directory.</p>
+                    </div>
+                </div>
+                <form method="post" class="delete-form" onsubmit="return confirm('Are you sure you want to delete all files in this directory?');">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($deleteCsrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+                    <?php if (isset($_GET['path'])): ?>
+                        <input type="hidden" name="current_path" value="<?php echo htmlspecialchars($_GET['path'], ENT_QUOTES, 'UTF-8'); ?>">
+                    <?php endif; ?>
+                    <input type="hidden" name="delete_all_files" value="1">
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-danger">Delete All Files</button>
+                    </div>
+                </form>
+                <?php if ($delete_message !== ''): ?>
+                    <div class="alert-stack" role="status" aria-live="polite">
+                        <?php echo $delete_message; ?>
+                    </div>
+                <?php endif; ?>
+            </article>
+        </section>
 
         <div class="breadcrumbs">
             <i class="fas fa-folder-open icon"></i>
@@ -963,7 +1188,7 @@ $loginCsrfToken = get_csrf_token('login');
             <?php if (isset($login_error)): ?>
                 <p class="error-message"><?php echo htmlspecialchars($login_error, ENT_QUOTES, 'UTF-8'); ?></p>
             <?php endif; ?>
-            <input type="password" name="password" placeholder="Enter Password" required>
+            <input type="password" name="password" placeholder="Enter Password" required minlength="8">
             <input type="submit" value="Login" <?php if (isset($authState['lock_until']) && $authState['lock_until'] > time()) echo 'disabled'; ?>>
         </form>
     </div>
