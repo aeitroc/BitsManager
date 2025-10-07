@@ -12,3 +12,4 @@ logs
 .vscode
 .github
 .agents
+.DS_Store
