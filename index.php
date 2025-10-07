@@ -5,7 +5,7 @@ $httpsRequest = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (i
 $cookieParams = [
     'lifetime' => 0,
     'path' => '/',
-    'domain' => '',
+    'domain' => null,
     'secure' => $httpsRequest,
     'httponly' => true,
     'samesite' => 'Strict',
@@ -17,7 +17,7 @@ if (PHP_VERSION_ID >= 70300) {
     session_set_cookie_params(
         $cookieParams['lifetime'],
         $cookieParams['path'] . '; samesite=Strict',
-        $cookieParams['domain'],
+        $cookieParams['domain'] ?? '',
         $cookieParams['secure'],
         $cookieParams['httponly']
     );
@@ -37,7 +37,7 @@ define('LOG_FILE', LOG_DIRECTORY . '/app.log');
 define('MAX_UPLOAD_FILES', 10);
 define('MAX_UPLOAD_BYTES', 10 * 1024 * 1024); // 10 MB per file
 define('ALLOWED_UPLOAD_EXTENSIONS', [
-    'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'csv', 'zip', 'tar', 'gz'
+    'txt', 'pdf', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'gif', 'csv', 'zip', 'tar', 'gz'
 ]);
 
 header('X-Frame-Options: DENY');
@@ -152,6 +152,71 @@ function normalize_upload_filename(string $filename): string
     return $sanitized ?? 'upload';
 }
 
+function detect_web_server_user(): ?string
+{
+    // Try to detect the web server user
+    if (function_exists('posix_getpwuid') && function_exists('posix_geteuid')) {
+        $processUser = posix_getpwuid(posix_geteuid());
+        return $processUser['name'] ?? null;
+    }
+    
+    // Fallback: try to get from environment (sanitize to prevent injection)
+    $envUser = getenv('USER') ?: getenv('APACHE_RUN_USER') ?: getenv('USERNAME');
+    if ($envUser) {
+        // Validate that the username contains only safe characters
+        if (preg_match('/^[a-zA-Z0-9_-]+$/', $envUser)) {
+            return $envUser;
+        }
+    }
+    
+    // Last resort: check current user via whoami (no user input, shell-safe)
+    if (function_exists('exec')) {
+        $output = [];
+        // Note: This command has no variables/user input, so it's safe from injection
+        @exec('whoami 2>/dev/null', $output);
+        if (!empty($output[0])) {
+            $username = trim($output[0]);
+            // Validate the output to ensure it's a valid username format
+            if (preg_match('/^[a-zA-Z0-9_-]+$/', $username)) {
+                return $username;
+            }
+        }
+    }
+    
+    return null;
+}
+
+function get_permission_fix_instructions(string $path): string
+{
+    $webUser = detect_web_server_user();
+    $absPath = realpath($path) ?: $path;
+    
+    $instructions = '<div style="background: rgba(0,0,0,0.3); padding: 20px; border-radius: 8px; margin: 20px 0; text-align: left;">';
+    $instructions .= '<h3 style="color: #e94560; margin-top: 0;">How to Fix Permission Issues:</h3>';
+    $instructions .= '<p><strong>Directory Path:</strong> <code style="background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 4px;">' . htmlspecialchars($absPath, ENT_QUOTES, 'UTF-8') . '</code></p>';
+    
+    if ($webUser) {
+        $instructions .= '<p><strong>Web Server User:</strong> <code style="background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 4px;">' . htmlspecialchars($webUser, ENT_QUOTES, 'UTF-8') . '</code></p>';
+    }
+    
+    $instructions .= '<p><strong>Option 1 - Grant write permissions to the directory:</strong></p>';
+    $instructions .= '<pre style="background: rgba(0,0,0,0.5); padding: 15px; border-radius: 6px; overflow-x: auto;">chmod 755 ' . htmlspecialchars($absPath, ENT_QUOTES, 'UTF-8') . '</pre>';
+    
+    if ($webUser && $webUser !== 'root') {
+        $instructions .= '<p><strong>Option 2 - Change ownership to web server user:</strong></p>';
+        $instructions .= '<pre style="background: rgba(0,0,0,0.5); padding: 15px; border-radius: 6px; overflow-x: auto;">chown ' . htmlspecialchars($webUser, ENT_QUOTES, 'UTF-8') . ':' . htmlspecialchars($webUser, ENT_QUOTES, 'UTF-8') . ' ' . htmlspecialchars($absPath, ENT_QUOTES, 'UTF-8') . '
+chmod 755 ' . htmlspecialchars($absPath, ENT_QUOTES, 'UTF-8') . '</pre>';
+    }
+    
+    $instructions .= '<p><strong>Option 3 - Grant write permissions to everyone (less secure):</strong></p>';
+    $instructions .= '<pre style="background: rgba(0,0,0,0.5); padding: 15px; border-radius: 6px; overflow-x: auto;">chmod 777 ' . htmlspecialchars($absPath, ENT_QUOTES, 'UTF-8') . '</pre>';
+    
+    $instructions .= '<p style="margin-bottom: 0;"><em>After changing permissions, refresh this page to continue.</em></p>';
+    $instructions .= '</div>';
+    
+    return $instructions;
+}
+
 // Handle file downloads
 if (isset($_GET['download']) && isset($_SESSION['loggedin']) && $_SESSION['loggedin'] === true) {
     $downloadTarget = safe_realpath(APP_ROOT, $_GET['download']);
@@ -186,12 +251,15 @@ if (isset($_GET['download']) && isset($_SESSION['loggedin']) && $_SESSION['logge
 
         // Prepare response headers
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        // Escape filename to prevent header injection
+        $safeFilename = str_replace(['"', "\r", "\n"], ['', '', ''], $filename);
+        header('Content-Disposition: attachment; filename="' . $safeFilename . '"');
         header('Cache-Control: no-cache, must-revalidate');
         header('Pragma: no-cache');
         header('Accept-Ranges: none');
-        if ($knownSize) {
-            header('Content-Length: ' . (string)$filesize);
+        if ($knownSize && $filesize >= 0) {
+            // Validate filesize is non-negative before setting Content-Length
+            header('Content-Length: ' . (int)$filesize);
         }
 
         @set_time_limit(0);
@@ -239,6 +307,51 @@ if (isset($_GET['download']) && isset($_SESSION['loggedin']) && $_SESSION['logge
 
 // Check if config file exists. If not, start setup or block reset depending on lock.
 if (!file_exists(CONFIG_FILE)) {
+    // Pre-check: Test if directory is writable before showing setup form
+    if (!file_exists(SETUP_LOCK_FILE) && !is_writable(APP_ROOT)) {
+        $webUser = detect_web_server_user();
+        $dirPerms = substr(sprintf('%o', @fileperms(APP_ROOT)), -4);
+        
+        audit_log('setup_directory_not_writable', [
+            'path' => APP_ROOT,
+            'permissions' => $dirPerms,
+            'webUser' => $webUser,
+            'isWritable' => is_writable(APP_ROOT),
+        ]);
+        ?>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Permission Error - Setup Required</title>
+            <meta name="robots" content="noindex, nofollow">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { font-family: Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+                .container { max-width: 800px; padding: 30px; background: rgba(22, 33, 62, 0.8); border-radius: 12px; border: 1px solid rgba(233, 69, 96, 0.2); box-shadow: 0 8px 32px rgba(0,0,0,0.37); }
+                h1 { color: #e94560; margin-top: 0; }
+                code, pre { font-family: 'Courier New', monospace; }
+                a { color: #e94560; }
+                .warning-icon { font-size: 48px; text-align: center; margin-bottom: 20px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="warning-icon">⚠️</div>
+                <h1>Directory Permission Error</h1>
+                <p>The application directory does not have write permissions. The web server cannot create the configuration file.</p>
+                <p><strong>Current directory permissions:</strong> <code><?php echo htmlspecialchars($dirPerms, ENT_QUOTES, 'UTF-8'); ?></code></p>
+                <?php if ($webUser): ?>
+                    <p><strong>Web server is running as:</strong> <code><?php echo htmlspecialchars($webUser, ENT_QUOTES, 'UTF-8'); ?></code></p>
+                <?php endif; ?>
+                <?php echo get_permission_fix_instructions(APP_ROOT); ?>
+            </div>
+        </body>
+        </html>
+        <?php
+        exit();
+    }
+    
     if (file_exists(SETUP_LOCK_FILE)) {
         audit_log('setup_blocked_missing_config', []);
         ?>
@@ -274,29 +387,78 @@ if (!file_exists(CONFIG_FILE)) {
 
         if ($password === $confirm_password) {
             if (strlen($password) >= 8) {
-                $password_hash = password_hash($password, PASSWORD_DEFAULT);
-                $config_content = "<?php\nreturn [\n    'password_hash' => '" . $password_hash . "',\n];\n";
-                $writeResult = @file_put_contents(CONFIG_FILE, $config_content, LOCK_EX);
-                if ($writeResult !== false) {
-                    @chmod(CONFIG_FILE, 0640);
-                    @file_put_contents(SETUP_LOCK_FILE, (string)time(), LOCK_EX);
-                    audit_log('setup_completed', ['userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? 'unknown']);
-                    header('Location: ' . htmlspecialchars($_SERVER['PHP_SELF'], ENT_QUOTES, 'UTF-8'));
-                    exit();
+                // Early fail-fast check: try to create a test file using tempnam to prevent race conditions
+                $testFile = @tempnam(APP_ROOT, '.write_test_');
+                $canWrite = $testFile !== false;
+                if ($canWrite) {
+                    @unlink($testFile);
                 }
+                
+                if (!$canWrite) {
+                    $webUser = detect_web_server_user();
+                    $dirPerms = substr(sprintf('%o', @fileperms(APP_ROOT)), -4);
+                    $lastError = error_get_last();
+                    
+                    audit_log('setup_write_test_failed', [
+                        'path' => APP_ROOT,
+                        'permissions' => $dirPerms,
+                        'webUser' => $webUser,
+                        'lastError' => $lastError['message'] ?? null,
+                    ]);
+                    
+                    $setup_error = '<div style="text-align: left;">';
+                    $setup_error .= '<strong>Failed to write configuration file.</strong><br><br>';
+                    $setup_error .= 'The application directory does not have write permissions.<br><br>';
+                    $setup_error .= '<strong>Directory:</strong> <code>' . htmlspecialchars(APP_ROOT, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    $setup_error .= '<strong>Current Permissions:</strong> <code>' . htmlspecialchars($dirPerms, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    if ($webUser) {
+                        $setup_error .= '<strong>Web Server User:</strong> <code>' . htmlspecialchars($webUser, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    }
+                    $setup_error .= get_permission_fix_instructions(APP_ROOT);
+                    $setup_error .= '</div>';
+                } else {
+                    $password_hash = password_hash($password, PASSWORD_DEFAULT);
+                    $config_content = "<?php\nreturn [\n    'password_hash' => '" . $password_hash . "',\n];\n";
+                    $writeResult = @file_put_contents(CONFIG_FILE, $config_content, LOCK_EX);
+                    if ($writeResult !== false) {
+                        @chmod(CONFIG_FILE, 0640);
+                        @file_put_contents(SETUP_LOCK_FILE, (string)time(), LOCK_EX);
+                        audit_log('setup_completed', ['userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? 'unknown']);
+                        // Use fixed path for secure redirect after setup
+                        header('Location: index.php');
+                        exit();
+                    }
 
-                $lastError = error_get_last();
-                $writeContext = [
-                    'configPath' => CONFIG_FILE,
-                    'configExists' => file_exists(CONFIG_FILE),
-                    'configPerms' => file_exists(CONFIG_FILE) ? substr(sprintf('%o', @fileperms(CONFIG_FILE)), -4) : null,
-                    'dirWritable' => is_writable(APP_ROOT),
-                    'dirPerms' => substr(sprintf('%o', @fileperms(APP_ROOT)), -4),
-                    'diskFree' => @disk_free_space(APP_ROOT),
-                    'lastError' => $lastError['message'] ?? null,
-                ];
-                $setup_error = 'Failed to write configuration file. Check directory permissions.';
-                audit_log('setup_write_failed', $writeContext);
+                    // If we reach here, the write failed despite passing the test
+                    $webUser = detect_web_server_user();
+                    $dirPerms = substr(sprintf('%o', @fileperms(APP_ROOT)), -4);
+                    $lastError = error_get_last();
+                    $writeContext = [
+                        'configPath' => CONFIG_FILE,
+                        'configExists' => file_exists(CONFIG_FILE),
+                        'configPerms' => file_exists(CONFIG_FILE) ? substr(sprintf('%o', @fileperms(CONFIG_FILE)), -4) : null,
+                        'dirWritable' => is_writable(APP_ROOT),
+                        'dirPerms' => $dirPerms,
+                        'diskFree' => @disk_free_space(APP_ROOT),
+                        'webUser' => $webUser,
+                        'lastError' => $lastError['message'] ?? null,
+                    ];
+                    audit_log('setup_write_failed', $writeContext);
+                    
+                    $setup_error = '<div style="text-align: left;">';
+                    $setup_error .= '<strong>Failed to write configuration file: config.php</strong><br><br>';
+                    $setup_error .= '<strong>File Path:</strong> <code>' . htmlspecialchars(CONFIG_FILE, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    $setup_error .= '<strong>Directory:</strong> <code>' . htmlspecialchars(APP_ROOT, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    $setup_error .= '<strong>Directory Permissions:</strong> <code>' . htmlspecialchars($dirPerms, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    if ($webUser) {
+                        $setup_error .= '<strong>Web Server User:</strong> <code>' . htmlspecialchars($webUser, ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    }
+                    if ($lastError && isset($lastError['message'])) {
+                        $setup_error .= '<strong>Error:</strong> <code>' . htmlspecialchars($lastError['message'], ENT_QUOTES, 'UTF-8') . '</code><br>';
+                    }
+                    $setup_error .= get_permission_fix_instructions(APP_ROOT);
+                    $setup_error .= '</div>';
+                }
             } else {
                 $setup_error = 'Password must be at least 8 characters long.';
                 audit_log('setup_password_too_short', ['length' => strlen($password)]);
@@ -381,7 +543,7 @@ if (!file_exists(CONFIG_FILE)) {
             <p>Please create a strong administrator password (minimum 8 characters).</p>
             <form method="post" class="setup-form">
                 <?php if (isset($setup_error)): ?>
-                    <p class="error-message"><?php echo htmlspecialchars($setup_error, ENT_QUOTES, 'UTF-8'); ?></p>
+                    <div class="error-message"><?php echo $setup_error; ?></div>
                 <?php endif; ?>
                 <input type="password" name="setup_password" placeholder="Enter New Password" required minlength="8">
                 <input type="password" name="confirm_password" placeholder="Confirm Password" required minlength="8">
@@ -426,7 +588,8 @@ if (isset($_GET['logout'])) {
         setcookie(session_name(), '', time() - 42000, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
     }
     session_destroy();
-    header('Location: ' . htmlspecialchars($_SERVER['PHP_SELF'], ENT_QUOTES, 'UTF-8'));
+    // Use fixed path for secure redirect after logout
+    header('Location: index.php');
     exit();
 }
 
